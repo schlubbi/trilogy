@@ -51,6 +51,8 @@ class SSLContextTest < Minitest::Test
   end
 
   def test_contexts_do_not_share_protocol_settings
+    return skip "TLS 1.3 is not supported by the client" unless defined?(OpenSSL::SSL::TLS1_3_VERSION)
+
     tls12 = Trilogy::SSLContext.new(@tls_options)
     tls13 = Trilogy::SSLContext.new(@tls_options.merge(
       tls_min_version: Trilogy::TLS_VERSION_13,
