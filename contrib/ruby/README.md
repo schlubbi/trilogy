@@ -51,6 +51,53 @@ results << client.query("SELECT name FROM users WHERE id = 1; SELECT name FROM u
 results << client.next_result while client.more_results_exist?
 ```
 
+### Reusing TLS contexts
+
+Use `Trilogy::SSLContext` to share TLS configuration and loaded trust material
+across connections. Reuse is opt-in; connections without `ssl_context:` continue
+to construct a context for each connection.
+
+```ruby
+tls = Trilogy::SSLContext.new(
+  ssl_mode: Trilogy::SSL_VERIFY_IDENTITY,
+  ssl_ca: "/path/to/ca.pem",
+)
+
+client = Trilogy.new(host: "db.example.com", username: "app", ssl_context: tls)
+```
+
+Create one context per TLS configuration, after worker processes fork. Contexts
+and their option snapshots are immutable. Configure TLS options on the context,
+not alongside `ssl_context:` on a connection; conflicting options raise an error.
+The context defaults to `SSL_VERIFY_IDENTITY`.
+
+Each connection still creates a separate `SSL` object and performs its own
+handshake and hostname verification. SNI and hostname checks remain
+connection-specific. This does not cache a successful verification result.
+
+Loaded CA files and client credentials are retained until the context is
+released. Construct a replacement context to reload rotated material; there is
+no automatic invalidation or global cache. CA directories retain OpenSSL's
+lazy-lookup behavior. Existing connections keep their original context alive.
+
+### Benchmarking TLS context reuse
+
+From `contrib/ruby`, with the development dependencies available:
+
+```sh
+rake compile
+ruby -rbigdecimal -Ilib -Itest test/ssl_context_test.rb
+ruby -rbigdecimal -Ilib script/ssl_context_bench.rb --assert-speedup
+SAMPLES=50 THREADS=4 ruby -rbigdecimal -Ilib script/ssl_context_bench.rb --assert-speedup
+```
+
+The fixture binds only to loopback, generates a temporary certificate, appends
+it to the system CA bundle, and completes the MySQL greeting, TLS upgrade, and
+authentication through the actual Trilogy extension. It requires no database
+or production credentials. Timings exclude context construction in the reuse
+case; that one-time cost is reported separately. Ping/close are outside the
+per-connection timing but included in total wall time.
+
 ## Building
 You should use the rake commands to build/install/release the gem
 For instance:

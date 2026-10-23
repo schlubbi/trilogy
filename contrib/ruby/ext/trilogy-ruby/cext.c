@@ -163,8 +163,40 @@ static ID id_socket, id_host, id_port, id_username, id_password, id_found_rows, 
     id_write_timeout, id_keepalive_enabled, id_keepalive_idle, id_keepalive_interval, id_keepalive_count,
     id_password, id_database, id_enable_cleartext_plugin,
     id_ssl_ca, id_ssl_capath, id_ssl_cert, id_ssl_cipher, id_ssl_crl, id_ssl_crlpath, id_ssl_key,
-    id_ssl_mode, id_tls_ciphersuites, id_tls_min_version, id_tls_max_version, id_multi_statement, id_multi_result,
+    id_ssl_mode, id_ssl_context, id_tls_ciphersuites, id_tls_min_version, id_tls_max_version, id_multi_statement, id_multi_result,
     id_from_code, id_from_errno, id_max_allowed_packet;
+
+struct trilogy_ssl_context {
+    SSL_CTX *ctx;
+};
+
+static void free_ssl_context(void *ptr)
+{
+    struct trilogy_ssl_context *context = ptr;
+    SSL_CTX_free(context->ctx);
+    xfree(context);
+}
+
+static size_t ssl_context_memsize(const void *ptr)
+{
+    (void)ptr;
+    return sizeof(struct trilogy_ssl_context);
+}
+
+static const rb_data_type_t ssl_context_data_type = {
+    .wrap_struct_name = "trilogy/ssl_context",
+    .function = {
+        .dfree = free_ssl_context,
+        .dsize = ssl_context_memsize,
+    },
+    .flags = RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
+static VALUE allocate_ssl_context(VALUE klass)
+{
+    struct trilogy_ssl_context *context;
+    return TypedData_Make_Struct(klass, struct trilogy_ssl_context, &ssl_context_data_type, context);
+}
 
 struct trilogy_ctx {
     trilogy_conn_t conn;
@@ -256,6 +288,17 @@ static int trilogy_error_recoverable_p(int rc)
     return rc == TRILOGY_ERR || rc == TRILOGY_MAX_PACKET_EXCEEDED;
 }
 
+NORETURN(static void trilogy_ssl_fail(VALUE));
+static void trilogy_ssl_fail(VALUE message)
+{
+    unsigned long error = ERR_get_error();
+    ERR_clear_error();
+    if (ERR_GET_LIB(error) == ERR_LIB_SYS) {
+        trilogy_syserr_fail_str(ERR_GET_REASON(error), message);
+    }
+    rb_raise(Trilogy_SSLError, "%" PRIsVALUE ": SSL Error: %s", message, ERR_reason_error_string(error));
+}
+
 NORETURN(static void handle_trilogy_error(struct trilogy_ctx *, int, const char *, ...));
 static void handle_trilogy_error(struct trilogy_ctx *ctx, int rc, const char *msg, ...)
 {
@@ -290,13 +333,7 @@ static void handle_trilogy_error(struct trilogy_ctx *ctx, int rc, const char *ms
     }
 
     case TRILOGY_OPENSSL_ERR: {
-        unsigned long ossl_error = ERR_get_error();
-        ERR_clear_error();
-        if (ERR_GET_LIB(ossl_error) == ERR_LIB_SYS) {
-            int err_reason = ERR_GET_REASON(ossl_error);
-            trilogy_syserr_fail_str(err_reason, rbmsg);
-        }
-        rb_raise(Trilogy_SSLError, "%" PRIsVALUE ": SSL Error: %s", rbmsg, ERR_reason_error_string(ossl_error));
+        trilogy_ssl_fail(rbmsg);
     }
 
     case TRILOGY_DNS_ERR: {
@@ -539,7 +576,8 @@ static void auth_switch(struct trilogy_ctx *ctx, trilogy_handshake_t *handshake)
     }
 }
 
-static void authenticate(struct trilogy_ctx *ctx, trilogy_handshake_t *handshake, trilogy_ssl_mode_t ssl_mode)
+static void authenticate(struct trilogy_ctx *ctx, trilogy_handshake_t *handshake, trilogy_ssl_mode_t ssl_mode,
+                         SSL_CTX *ssl_context)
 {
     int rc;
 
@@ -554,7 +592,8 @@ static void authenticate(struct trilogy_ctx *ctx, trilogy_handshake_t *handshake
                 handle_trilogy_error(ctx, rc, "trilogy_ssl_request_send");
             }
 
-            rc = trilogy_sock_upgrade_ssl(ctx->conn.socket);
+            rc = ssl_context ? trilogy_sock_upgrade_ssl_with_ctx(ctx->conn.socket, ssl_context)
+                             : trilogy_sock_upgrade_ssl(ctx->conn.socket);
             if (rc != TRILOGY_OK) {
                 handle_trilogy_error(ctx, rc, "trilogy_ssl_upgrade");
             }
@@ -619,6 +658,57 @@ static inline VALUE config_set_str(VALUE opts, ID key, char **member)
     return val;
 }
 
+static void config_set_ssl(VALUE opts, trilogy_sockopt_t *connopt, VALUE strings[8])
+{
+    VALUE val;
+    if ((val = rb_hash_lookup(opts, ID2SYM(id_ssl_mode))) != Qnil) {
+        Check_Type(val, T_FIXNUM);
+        connopt->ssl_mode = (trilogy_ssl_mode_t)NUM2INT(val);
+    }
+    strings[0] = config_set_str(opts, id_ssl_ca, &connopt->ssl_ca);
+    strings[1] = config_set_str(opts, id_ssl_capath, &connopt->ssl_capath);
+    strings[2] = config_set_str(opts, id_ssl_cert, &connopt->ssl_cert);
+    strings[3] = config_set_str(opts, id_ssl_cipher, &connopt->ssl_cipher);
+    strings[4] = config_set_str(opts, id_ssl_crl, &connopt->ssl_crl);
+    strings[5] = config_set_str(opts, id_ssl_crlpath, &connopt->ssl_crlpath);
+    strings[6] = config_set_str(opts, id_ssl_key, &connopt->ssl_key);
+    strings[7] = config_set_str(opts, id_tls_ciphersuites, &connopt->tls_ciphersuites);
+    if ((val = rb_hash_aref(opts, ID2SYM(id_tls_min_version))) != Qnil) {
+        Check_Type(val, T_FIXNUM);
+        connopt->tls_min_version = NUM2INT(val);
+    }
+    if ((val = rb_hash_aref(opts, ID2SYM(id_tls_max_version))) != Qnil) {
+        Check_Type(val, T_FIXNUM);
+        connopt->tls_max_version = NUM2INT(val);
+    }
+}
+
+static VALUE rb_ssl_context_initialize(VALUE self, VALUE opts)
+{
+    rb_check_frozen(self);
+    Check_Type(opts, T_HASH);
+    struct trilogy_ssl_context *context;
+    TypedData_Get_Struct(self, struct trilogy_ssl_context, &ssl_context_data_type, context);
+    if (context->ctx) {
+        rb_raise(rb_eArgError, "SSLContext is already initialized");
+    }
+    trilogy_sockopt_t connopt = {0};
+    VALUE strings[8];
+    config_set_ssl(opts, &connopt, strings);
+    if (connopt.ssl_mode < TRILOGY_SSL_VERIFY_IDENTITY || connopt.ssl_mode > TRILOGY_SSL_PREFERRED_NOVERIFY) {
+        rb_raise(rb_eArgError, "ssl_mode must enable TLS");
+    }
+    ERR_clear_error();
+    context->ctx = trilogy_ssl_ctx_new(&connopt);
+    if (!context->ctx) {
+        trilogy_ssl_fail(rb_str_new_cstr("trilogy_ssl_ctx_new"));
+    }
+    for (size_t i = 0; i < 8; i++) {
+        RB_GC_GUARD(strings[i]);
+    }
+    return self;
+}
+
 static VALUE rb_trilogy_connect(VALUE self, VALUE raw_socket, VALUE encoding, VALUE charset, VALUE opts)
 {
     struct trilogy_ctx *ctx = get_ctx(self);
@@ -632,11 +722,6 @@ static VALUE rb_trilogy_connect(VALUE self, VALUE raw_socket, VALUE encoding, VA
     connopt.encoding = NUM2INT(charset);
 
     Check_Type(opts, T_HASH);
-
-    if ((val = rb_hash_lookup(opts, ID2SYM(id_ssl_mode))) != Qnil) {
-        Check_Type(val, T_FIXNUM);
-        connopt.ssl_mode = (trilogy_ssl_mode_t)NUM2INT(val);
-    }
 
     if ((val = rb_hash_aref(opts, ID2SYM(id_connect_timeout))) != Qnil) {
         connopt.connect_timeout = double_to_timeval(NUM2DBL(val));
@@ -717,23 +802,17 @@ static VALUE rb_trilogy_connect(VALUE self, VALUE raw_socket, VALUE encoding, VA
         connopt.flags |= TRILOGY_CAPABILITIES_MULTI_STATEMENTS;
     }
 
-    VALUE ssl_ca = config_set_str(opts, id_ssl_ca, &connopt.ssl_ca);
-    VALUE ssl_capath = config_set_str(opts, id_ssl_capath, &connopt.ssl_capath);
-    VALUE ssl_cert = config_set_str(opts, id_ssl_cert, &connopt.ssl_cert);
-    VALUE ssl_cipher = config_set_str(opts, id_ssl_cipher, &connopt.ssl_cipher);
-    VALUE ssl_crl = config_set_str(opts, id_ssl_crl, &connopt.ssl_crl);
-    VALUE ssl_crlpath = config_set_str(opts, id_ssl_crlpath, &connopt.ssl_crlpath);
-    VALUE ssl_key = config_set_str(opts, id_ssl_key, &connopt.ssl_key);
-    VALUE tls_ciphersuites = config_set_str(opts, id_tls_ciphersuites, &connopt.tls_ciphersuites);
-
-    if ((val = rb_hash_aref(opts, ID2SYM(id_tls_min_version))) != Qnil) {
-        Check_Type(val, T_FIXNUM);
-        connopt.tls_min_version = NUM2INT(val);
-    }
-
-    if ((val = rb_hash_aref(opts, ID2SYM(id_tls_max_version))) != Qnil) {
-        Check_Type(val, T_FIXNUM);
-        connopt.tls_max_version = NUM2INT(val);
+    VALUE ssl_strings[8];
+    config_set_ssl(opts, &connopt, ssl_strings);
+    VALUE rb_ssl_context = rb_hash_aref(opts, ID2SYM(id_ssl_context));
+    SSL_CTX *ssl_context = NULL;
+    if (!NIL_P(rb_ssl_context)) {
+        struct trilogy_ssl_context *context;
+        TypedData_Get_Struct(rb_ssl_context, struct trilogy_ssl_context, &ssl_context_data_type, context);
+        if (!context->ctx) {
+            rb_raise(rb_eArgError, "SSLContext is not initialized");
+        }
+        ssl_context = context->ctx;
     }
 
     VALUE io = rb_io_get_io(raw_socket);
@@ -759,7 +838,7 @@ static VALUE rb_trilogy_connect(VALUE self, VALUE raw_socket, VALUE encoding, VA
     memcpy(ctx->server_version, handshake.server_version, TRILOGY_SERVER_VERSION_SIZE);
     ctx->server_version[TRILOGY_SERVER_VERSION_SIZE] = 0;
 
-    authenticate(ctx, &handshake, connopt.ssl_mode);
+    authenticate(ctx, &handshake, connopt.ssl_mode, ssl_context);
 
     rb_trilogy_release_buffer(ctx);
 
@@ -769,14 +848,10 @@ static VALUE rb_trilogy_connect(VALUE self, VALUE raw_socket, VALUE encoding, VA
     RB_GC_GUARD(password);
     RB_GC_GUARD(path);
     RB_GC_GUARD(database);
-    RB_GC_GUARD(ssl_ca);
-    RB_GC_GUARD(ssl_capath);
-    RB_GC_GUARD(ssl_cert);
-    RB_GC_GUARD(ssl_cipher);
-    RB_GC_GUARD(ssl_crl);
-    RB_GC_GUARD(ssl_crlpath);
-    RB_GC_GUARD(ssl_key);
-    RB_GC_GUARD(tls_ciphersuites);
+    RB_GC_GUARD(rb_ssl_context);
+    for (size_t i = 0; i < 8; i++) {
+        RB_GC_GUARD(ssl_strings[i]);
+    }
 
     return Qnil;
 }
@@ -1367,6 +1442,9 @@ RUBY_FUNC_EXPORTED void Init_cext(void)
 
     VALUE Trilogy = rb_const_get(rb_cObject, rb_intern("Trilogy"));
     rb_define_alloc_func(Trilogy, allocate_trilogy);
+    VALUE SSLContext = rb_define_class_under(Trilogy, "SSLContext", rb_cObject);
+    rb_define_alloc_func(SSLContext, allocate_ssl_context);
+    rb_define_private_method(SSLContext, "_initialize", rb_ssl_context_initialize, 1);
 
     rb_define_private_method(Trilogy, "_connect", rb_trilogy_connect, 4);
     rb_define_method(Trilogy, "change_db", rb_trilogy_change_db, 1);
@@ -1470,6 +1548,7 @@ RUBY_FUNC_EXPORTED void Init_cext(void)
     id_ssl_crlpath = rb_intern("ssl_crlpath");
     id_ssl_key = rb_intern("ssl_key");
     id_ssl_mode = rb_intern("ssl_mode");
+    id_ssl_context = rb_intern("ssl_context");
     id_tls_ciphersuites = rb_intern("tls_ciphersuites");
     id_tls_min_version = rb_intern("tls_min_version");
     id_tls_max_version = rb_intern("tls_max_version");
