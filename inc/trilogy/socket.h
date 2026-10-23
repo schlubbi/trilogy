@@ -117,6 +117,10 @@ static inline int trilogy_sock_fd(trilogy_sock_t *sock) { return sock->fd_cb(soc
 trilogy_sock_t *trilogy_sock_new(const trilogy_sockopt_t *opts);
 int trilogy_sock_resolve(trilogy_sock_t *raw);
 int trilogy_sock_upgrade_ssl(trilogy_sock_t *raw);
+/* The caller owns the returned context and releases it with SSL_CTX_free. */
+SSL_CTX *trilogy_ssl_ctx_new(const trilogy_sockopt_t *opts);
+/* Borrows ctx; the connection's SSL object retains its own reference. */
+int trilogy_sock_upgrade_ssl_with_ctx(trilogy_sock_t *raw, SSL_CTX *ctx);
 
 /* trilogy_sock_check - Verify if the socket is still alive and not disconnected.
  *

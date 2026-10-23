@@ -537,9 +537,12 @@ int trilogy_set_max_proto_version(SSL_CTX *ctx, trilogy_tls_version_t version)
 }
 #endif
 
-static SSL_CTX *trilogy_ssl_ctx(const trilogy_sockopt_t *opts)
+SSL_CTX *trilogy_ssl_ctx_new(const trilogy_sockopt_t *opts)
 {
     SSL_CTX *ssl_ctx = SSL_CTX_new(SSLv23_client_method());
+    if (!ssl_ctx) {
+        return NULL;
+    }
 
     // Now handle all the custom options that we're given.
     if (opts->tls_min_version != TRILOGY_TLS_VERSION_UNDEF) {
@@ -641,20 +644,28 @@ fail:
 
 int trilogy_sock_upgrade_ssl(trilogy_sock_t *_sock)
 {
+    ERR_clear_error();
+    SSL_CTX *ctx = trilogy_ssl_ctx_new(&_sock->opts);
+    if (!ctx) {
+        return TRILOGY_OPENSSL_ERR;
+    }
+    int rc = trilogy_sock_upgrade_ssl_with_ctx(_sock, ctx);
+    SSL_CTX_free(ctx);
+    return rc;
+}
+
+int trilogy_sock_upgrade_ssl_with_ctx(trilogy_sock_t *_sock, SSL_CTX *ctx)
+{
     struct trilogy_sock *sock = (struct trilogy_sock *)_sock;
 
     // This shouldn't be necessary, but protects against other libraries in the same process incorrectly leaving errors
     // in the queue.
     ERR_clear_error();
 
-    SSL_CTX *ctx = trilogy_ssl_ctx(&sock->base.opts);
-
-    if (!ctx) {
+    sock->ssl = SSL_new(ctx);
+    if (!sock->ssl) {
         return TRILOGY_OPENSSL_ERR;
     }
-
-    sock->ssl = SSL_new(ctx);
-    SSL_CTX_free(ctx);
 
     if (sock->base.opts.ssl_mode == TRILOGY_SSL_VERIFY_IDENTITY && sock->base.opts.hostname == NULL) {
         // If hostname validation is requested and no hostname provided, treat it as an error.

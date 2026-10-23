@@ -6,6 +6,7 @@ require "trilogy/error"
 require "trilogy/result"
 require "trilogy/cext"
 require "trilogy/encoding"
+require "trilogy/ssl_context"
 
 class Trilogy
   IO_TIMEOUT_ERROR =
@@ -48,6 +49,17 @@ class Trilogy
   prepend(Synchronization)
 
   def initialize(options = {})
+    context = options[:ssl_context]
+    unless context.nil?
+      unless context.is_a?(SSLContext)
+        raise TypeError, "ssl_context must be a Trilogy::SSLContext"
+      end
+      conflicts = options.keys & SSLContext::OPTION_KEYS
+      unless conflicts.empty?
+        raise ArgumentError, "configure #{conflicts.join(', ')} on ssl_context, not the connection"
+      end
+      options = options.merge(context.options)
+    end
     options[:port] = options[:port].to_i if options[:port]
     mysql_encoding = options[:encoding] || "utf8mb4"
     encoding = Trilogy::Encoding.find(mysql_encoding)
